@@ -1,0 +1,763 @@
+# =============================================================================
+# RESPIRATORY DISEASE CLASSIFIER — STACKED PIPELINE
+# =============================================================================
+# Layer 1 : XGBoost binary classifier  (119 tabular features → healthy / diseased)
+# Layer 2 : EfficientNet CNN           (cough + vowel .wav → asthma / copd / covid)
+#
+# INPUTS  (update CONFIG before running):
+#   layer1_path         — path to layer1_xgboost.joblib  (XGBoost .ubj format)
+#   layer2_pkl_path     — path to inference_pipeline.pkl (RespiratoryClassifier pickle)
+#   val_features_csv    — CSV with 119 features + 'id' + 'disease' columns
+#   test_features_csv   — same format for test split
+#   val_audio_csv       — CSV with 'id', 'cough_path', 'vowel_path' columns (diseased only)
+#   test_audio_csv      — same format for test split
+#
+# LABEL CONVENTIONS:
+#   Layer 1 input  :  disease col integer  →  0 if healthy(=3), else 1
+#   Layer 2 output :  idx_to_label stored inside the pkl  {0:'asthma',1:'copd',2:'covid'}
+#   INT_TO_CLASSNAME: maps raw CSV integer labels to string names for evaluation
+#
+# OUTPUTS:
+#   full_stacked_pipeline.pkl   — pickled TwoLayerRespiratoryClassifier
+#   val_predictions.csv / test_predictions.csv
+#   Printed metrics + confusion matrix plots
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# SECTION 0 — IMPORTS
+# ---------------------------------------------------------------------------
+import os
+import sys
+import time
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torchaudio
+import torchaudio.transforms as T
+import librosa
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, confusion_matrix, classification_report,
+)
+
+warnings.filterwarnings("ignore")
+
+
+# ---------------------------------------------------------------------------
+# SECTION 1 — CONFIGURATION  (edit all paths here)
+# ---------------------------------------------------------------------------
+CONFIG = {
+    # -- Model paths --
+    "layer1_path"    : "/Volumes/Samsung_T5/layer1_xgboost.joblib",   # XGBoost .ubj file
+    "layer2_pkl_path": "/Volumes/Samsung_T5/inference_pipeline.pkl",  # RespiratoryClassifier pickle
+
+    # -- Feature CSVs (for Layer 1) --
+    # Must contain: 'id', <119 feature cols>, 'disease'
+    "val_features_csv" : "/Users/gracytanna/Downloads/processed_val_vowel_and_cough (1).csv",
+    "test_features_csv": "/Users/gracytanna/Downloads/processed_test_vowel_and_cough (1).csv",
+
+    # -- Audio path CSVs (for Layer 2, diseased patients only) --
+    # Must contain: 'id', 'cough_path', 'vowel_path'
+    "val_audio_csv" : "/Users/gracytanna/Downloads/only_paths_val_vowel_and_cough_healthy_dropped.csv",
+    "test_audio_csv": "/Users/gracytanna/Downloads/only_paths_test_vowel_and_cough_healthy_dropped.csv",
+
+    # -- Column names --
+    "id_col"   : "id",
+    "label_col": "disease",
+
+    # -- Layer 1 decision threshold --
+    # 0.5 = balanced; lower (e.g. 0.35) = higher sensitivity (fewer missed diseases)
+    "layer1_threshold": 0.5,
+
+    # -- Output --
+    "save_dir"          : "saved_models",
+    "pipeline_filename" : "full_stacked_pipeline.pkl",
+    "save_plots"        : True,
+}
+
+# Integer label → string class name (update if your CSV uses different codes)
+# Convention inherited from existing code: healthy=3, asthma=1, copd=2, covid=0
+INT_TO_CLASSNAME = {
+    3: "healthy",
+    1: "asthma",
+    2: "copd",
+    0: "covid",
+}
+
+os.makedirs(CONFIG["save_dir"], exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[DEVICE] Using: {DEVICE}")
+
+# ---------------------------------------------------------------------------
+# Windows → Mac path translation
+# Maps each Windows root (Drive:\folder) to its Mac equivalent.
+# Add or edit entries here if your mount points differ.
+# ---------------------------------------------------------------------------
+WIN_TO_MAC_ROOTS = {
+    r"E:\respiratory_classification_project": "/Volumes/Samsung_T5/respiratory_classification_project",
+    r"E:\first_iterations"                  : "/Volumes/Samsung_T5/first_iterations",
+}
+
+
+def fix_path(p: str) -> str:
+    """
+    Convert a Windows absolute path to its Mac equivalent.
+
+    Steps
+    -----
+    1. Match the longest Windows root prefix in WIN_TO_MAC_ROOTS.
+    2. Replace it with the corresponding Mac path.
+    3. Flip all backslashes to forward slashes.
+
+    If no Windows root is matched the path is returned unchanged
+    (so Linux/Mac paths already in the CSV pass through safely).
+    """
+    if not isinstance(p, str):
+        return p
+    # Sort by length descending so longer prefixes are tried first
+    for win_root in sorted(WIN_TO_MAC_ROOTS, key=len, reverse=True):
+        if p.startswith(win_root):
+            suffix   = p[len(win_root):]          # everything after the root
+            mac_root = WIN_TO_MAC_ROOTS[win_root]
+            return (mac_root + suffix).replace("\\", "/")
+    # Not a known Windows root — just normalise backslashes in case
+    return p.replace("\\", "/")
+
+
+# ---------------------------------------------------------------------------
+# SECTION 2 — EfficientNet architecture
+#   Must match what was used when inference_pipeline.pkl was created.
+#   The pkl stores the full model object, so this definition is needed
+#   to reconstruct the class for unpickling.
+# ---------------------------------------------------------------------------
+
+import torchvision.models as tv_models
+import torchvision.ops   as tv_ops
+
+
+class EfficientNetRespiratory(nn.Module):
+    """
+    EfficientNet-B0 backbone adapted for single-channel (grayscale) mel-spectrogram input.
+    Matches the architecture pickled inside inference_pipeline.pkl.
+    """
+    def __init__(self, num_classes: int = 3):
+        super().__init__()
+        base     = tv_models.efficientnet_b0(weights=None)
+        # Patch first conv to accept 1-channel input
+        old_conv = base.features[0][0]
+        base.features[0][0] = nn.Conv2d(
+            1, old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=False,
+        )
+        self.backbone   = base.features
+        self.avgpool    = base.avgpool
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.2),
+            nn.Linear(base.classifier[1].in_features, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.backbone(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        return self.classifier(x)
+
+
+class RespiratoryClassifier:
+    """
+    Thin wrapper around EfficientNetRespiratory that also stores the
+    mel-spectrogram transform and inference helpers.
+    This class must exist in the module namespace for unpickling to work.
+
+    Attributes stored in the pickle (decoded from pkl binary):
+        model       : EfficientNetRespiratory (nn.Module)
+        i2l         : dict  {int → class_name}   e.g. {0:'asthma',1:'copd',2:'covid'}
+        device      : torch.device
+        dur         : float  clip duration in seconds
+        img_size    : int    mel spectrogram height/width (if square-resized)
+        sample_rate : int
+        mel_transform / mel_spec / transform  (name may vary)
+    """
+
+    def __init__(self, model, mel_transform, i2l, device,
+                 sample_rate=16000, dur=5.0, img_size=None):
+        self.model        = model
+        self.mel_transform= mel_transform   # torchaudio nn.Sequential
+        self.i2l          = i2l             # idx → label string
+        self.device       = device
+        self.sample_rate  = sample_rate
+        self.dur          = dur
+        self.img_size     = img_size        # optional; may be None
+
+    # -- audio helpers (also used by TwoLayerRespiratoryClassifier) ----------
+
+    def _load_wav(self, wav_path: str) -> torch.Tensor:
+        """Load .wav, mono-mix, resample, pad/trim to self.dur seconds."""
+        try:
+            waveform, sr = torchaudio.load(wav_path)
+        except Exception:
+            y, sr = librosa.load(wav_path, sr=None, mono=True)
+            waveform = torch.tensor(y).unsqueeze(0)
+
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        if sr != self.sample_rate:
+            waveform = T.Resample(orig_freq=sr, new_freq=self.sample_rate)(waveform)
+
+        target = int(self.sample_rate * self.dur)
+        cur    = waveform.shape[1]
+        if cur < target:
+            waveform = torch.nn.functional.pad(waveform, (0, target - cur))
+        else:
+            waveform = waveform[:, :target]
+        return waveform
+
+    def _to_spec(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Convert waveform → normalised mel-spectrogram."""
+        spec = self.mel_transform(waveform)
+        mean = spec.mean()
+        std  = spec.std() + 1e-8
+        return (spec - mean) / std
+
+    def predict_from_paths(self, cough_path: str, vowel_path: str) -> str:
+        """
+        End-to-end Layer 2 inference from two .wav paths.
+        Returns the predicted disease label string.
+        """
+        cough_spec = self._to_spec(self._load_wav(cough_path))   # [1, n_mels, T]
+        vowel_spec = self._to_spec(self._load_wav(vowel_path))
+
+        # Concatenate along time axis → [1, n_mels, 2*T], then add batch dim
+        combined = torch.cat([cough_spec, vowel_spec], dim=2).unsqueeze(0)
+
+        # Optional resize if img_size was set during training
+        if self.img_size is not None:
+            combined = torch.nn.functional.interpolate(
+                combined, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False
+            )
+
+        combined = combined.to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            logits   = self.model(combined)
+            pred_idx = torch.argmax(torch.softmax(logits, dim=1), dim=1).item()
+
+        return self.i2l[pred_idx]
+
+    def predict_proba_from_paths(self, cough_path: str, vowel_path: str) -> dict:
+        """Returns {class_name: probability} dict."""
+        cough_spec = self._to_spec(self._load_wav(cough_path))
+        vowel_spec = self._to_spec(self._load_wav(vowel_path))
+        combined   = torch.cat([cough_spec, vowel_spec], dim=2).unsqueeze(0)
+        if self.img_size is not None:
+            combined = torch.nn.functional.interpolate(
+                combined, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False
+            )
+        combined = combined.to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            probs = torch.softmax(self.model(combined), dim=1)[0].cpu().numpy()
+        return {self.i2l[i]: float(probs[i]) for i in range(len(probs))}
+
+
+# ---------------------------------------------------------------------------
+# SECTION 3 — STACKED PIPELINE CLASS
+# ---------------------------------------------------------------------------
+
+class TwoLayerRespiratoryClassifier:
+    """
+    Stacked two-layer classifier for respiratory disease.
+
+    Inference flow per patient
+    --------------------------
+    1. Layer 1 (XGBoost, 119 tabular features)
+         → P(diseased)  ≥ threshold  →  diseased
+         → else                      →  healthy  (Layer 2 skipped)
+    2. Layer 2 (EfficientNet CNN, cough + vowel .wav)
+         → asthma | copd | covid
+
+    Final output: one of {healthy, asthma, copd, covid}
+    """
+
+    def __init__(
+        self,
+        layer1_model,            # fitted XGBClassifier
+        layer2_classifier,       # RespiratoryClassifier instance
+        layer1_threshold=0.5,
+    ):
+        self.layer1          = layer1_model
+        self.layer2          = layer2_classifier
+        self.layer1_threshold= layer1_threshold
+        print("[PIPELINE] TwoLayerRespiratoryClassifier initialised.")
+        print(f"[PIPELINE] Layer 1 threshold: {self.layer1_threshold}")
+
+    # ---- single-patient inference ------------------------------------------
+
+    def predict_single(
+        self,
+        feature_row,          # array-like, shape (119,)
+        cough_wav_path=None,  # str path; required only when Layer 1 says diseased
+        vowel_wav_path=None,
+    ) -> dict:
+        """
+        Returns
+        -------
+        dict with keys:
+            layer1_label  : 'healthy' | 'diseased'
+            layer1_prob   : P(diseased) from XGBoost
+            layer2_label  : 'asthma'|'copd'|'covid'|None
+            final_label   : 4-class string label
+        """
+        X             = np.array(feature_row).reshape(1, -1)
+        diseased_prob = float(self.layer1.predict_proba(X)[0, 1])
+        is_diseased   = diseased_prob >= self.layer1_threshold
+
+        if not is_diseased:
+            return {
+                "layer1_label": "healthy",
+                "layer1_prob" : diseased_prob,
+                "layer2_label": None,
+                "final_label" : "healthy",
+            }
+
+        # Layer 2
+        if cough_wav_path is None or vowel_wav_path is None:
+            # No audio available for a patient Layer 1 flagged as diseased
+            return {
+                "layer1_label": "diseased",
+                "layer1_prob" : diseased_prob,
+                "layer2_label": "unknown_diseased",
+                "final_label" : "unknown_diseased",
+            }
+
+        disease_label = self.layer2.predict_from_paths(cough_wav_path, vowel_wav_path)
+        return {
+            "layer1_label": "diseased",
+            "layer1_prob" : diseased_prob,
+            "layer2_label": disease_label,
+            "final_label" : disease_label,
+        }
+
+    # ---- batch inference ---------------------------------------------------
+
+    def predict_batch(self, X_features: pd.DataFrame, audio_df: pd.DataFrame) -> list:
+        """
+        Parameters
+        ----------
+        X_features : pd.DataFrame  — feature matrix (no id/label cols), row-aligned
+        audio_df   : pd.DataFrame  — must have 'cough_path', 'vowel_path' columns,
+                                     row-aligned with X_features
+
+        Returns
+        -------
+        list of result dicts (one per patient)
+        """
+        results = []
+        n       = len(X_features)
+        for i in range(n):
+            if i % 50 == 0:
+                print(f"  [BATCH] Patient {i+1}/{n} ...")
+            result = self.predict_single(
+                feature_row    = X_features.iloc[i].values,
+                cough_wav_path = audio_df.iloc[i]["cough_path"],
+                vowel_wav_path = audio_df.iloc[i]["vowel_path"],
+            )
+            results.append(result)
+        return results
+
+
+# ---------------------------------------------------------------------------
+# SECTION 4 — MODEL LOADING
+# ---------------------------------------------------------------------------
+
+def load_layer1(path: str) -> XGBClassifier:
+    """Load the XGBoost Layer 1 model (stored in .ubj / JSON format)."""
+    model = XGBClassifier()
+    model.load_model(path)
+    print(f"[LOAD] Layer 1 XGBoost loaded  — {model.n_features_in_} features, "
+          f"classes: {model.classes_}")
+    return model
+
+
+def load_layer2(pkl_path: str, device: torch.device) -> "RespiratoryClassifier":
+    """
+    Unpickle the RespiratoryClassifier.
+    RespiratoryClassifier and EfficientNetRespiratory must be defined in this
+    module's namespace before calling this function (they are, see Section 2).
+    """
+    # Inject the classes into __main__ so pickle can resolve them
+    import __main__
+    __main__.RespiratoryClassifier    = RespiratoryClassifier
+    __main__.EfficientNetRespiratory  = EfficientNetRespiratory
+
+    with open(pkl_path, "rb") as f:
+        clf = pickle.load(f)
+
+    # Move model to the target device
+    clf.model  = clf.model.to(device)
+    clf.device = device
+    clf.model.eval()
+
+    # Normalise attribute name for mel transform (pkl may use different names)
+    for attr in ("mel_transform", "mel_spec", "transform", "spectrogram"):
+        if hasattr(clf, attr) and getattr(clf, attr) is not None:
+            clf.mel_transform = getattr(clf, attr)
+            break
+
+    print(f"[LOAD] Layer 2 CNN (EfficientNet) loaded  — "
+          f"classes: {list(clf.i2l.values())}")
+    return clf
+
+
+def build_stacked_pipeline(
+    layer1_path: str,
+    layer2_pkl_path: str,
+    device: torch.device,
+    layer1_threshold: float = 0.5,
+) -> TwoLayerRespiratoryClassifier:
+    layer1 = load_layer1(layer1_path)
+    layer2 = load_layer2(layer2_pkl_path, device)
+    pipeline = TwoLayerRespiratoryClassifier(
+        layer1_model      = layer1,
+        layer2_classifier = layer2,
+        layer1_threshold  = layer1_threshold,
+    )
+    return pipeline
+
+
+# ---------------------------------------------------------------------------
+# SECTION 5 — DATA LOADING & ALIGNMENT
+# ---------------------------------------------------------------------------
+
+def load_features(csv_path: str, id_col: str, label_col: str):
+    """
+    Load the feature CSV.
+
+    Returns
+    -------
+    X         : pd.DataFrame  — feature matrix (no id, no label)
+    y_binary  : pd.Series     — 0=healthy (disease==3), 1=diseased
+    y_full    : pd.Series     — original integer labels
+    ids       : pd.Series     — patient IDs
+    """
+    print(f"\n[DATA] Loading features: {csv_path}")
+    df = pd.read_csv(csv_path)
+    print(f"[DATA] Shape: {df.shape}")
+
+    ids = df[id_col].copy() if id_col in df.columns else pd.Series(range(len(df)), name=id_col)
+
+    if id_col in df.columns:
+        df = df.drop(columns=[id_col])
+
+    assert label_col in df.columns, f"Label column '{label_col}' not found in {csv_path}."
+
+    y_full   = df[label_col].astype(int)
+    y_binary = df[label_col].apply(lambda x: 0 if x == 3 else 1)   # healthy=3 → 0
+    X        = df.drop(columns=[label_col])
+
+    print(f"[DATA] Healthy (0): {(y_binary==0).sum()} | Diseased (1): {(y_binary==1).sum()}")
+    return X, y_binary, y_full, ids
+
+
+def load_audio_paths(csv_path: str) -> pd.DataFrame:
+    """
+    Load audio path CSV with at least ['id', 'cough_path', 'vowel_path'].
+    Windows-style paths (E:\\...) are automatically translated to Mac paths
+    using the WIN_TO_MAC_ROOTS mapping defined at the top of this file.
+    """
+    print(f"[DATA] Loading audio paths: {csv_path}")
+    df = pd.read_csv(csv_path)
+    for col in ("cough_path", "vowel_path"):
+        assert col in df.columns, f"Column '{col}' not found in {csv_path}."
+        df[col] = df[col].map(fix_path)
+    print(f"[DATA] Audio entries: {len(df)}")
+    print(f"[DATA] Example cough path: {df['cough_path'].iloc[0]}")
+    print(f"[DATA] Example vowel path: {df['vowel_path'].iloc[0]}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# SECTION 6 — EVALUATION
+# ---------------------------------------------------------------------------
+
+ALL_CLASSES = ["healthy", "asthma", "copd", "covid"]
+
+
+def evaluate_pipeline_on_split(
+    pipeline: TwoLayerRespiratoryClassifier,
+    X_features_all: pd.DataFrame,
+    y_full_all: pd.Series,
+    ids_all: pd.Series,
+    audio_df: pd.DataFrame,
+    int_to_classname: dict,
+    id_col: str = "id",
+    split_name: str = "Validation",
+    save_plots: bool = True,
+    save_dir: str = ".",
+):
+    """
+    Evaluate the stacked pipeline on one data split.
+
+    Strategy
+    --------
+    - Feature CSV contains ALL patients (healthy + diseased).
+    - Audio CSV contains only DISEASED patients (healthy rows were dropped).
+    - Patients absent from the audio CSV are treated as healthy-only runs
+      (Layer 1 is sufficient; Layer 2 skipped with dummy audio=None).
+
+    Returns
+    -------
+    results_df : pd.DataFrame  — per-patient predictions
+    metrics    : dict          — summary metrics
+    """
+    print(f"\n{'='*60}")
+    print(f"EVALUATION — {split_name} Set")
+    print(f"{'='*60}")
+
+    # Build id → audio path lookup
+    audio_lookup = {}
+    if id_col in audio_df.columns:
+        for _, row in audio_df.iterrows():
+            audio_lookup[row[id_col]] = {
+                "cough_path": row["cough_path"],
+                "vowel_path": row["vowel_path"],
+            }
+
+    n_total = len(X_features_all)
+    y_binary_all = y_full_all.apply(lambda x: 0 if x == 3 else 1)
+    print(f"[EVAL] Total  : {n_total}")
+    print(f"[EVAL] Healthy (GT): {(y_binary_all==0).sum()}")
+    print(f"[EVAL] Diseased (GT): {(y_binary_all==1).sum()}")
+    print(f"[EVAL] Running inference …")
+
+    true_labels  = []
+    pred_labels  = []
+    layer1_probs = []
+    t0 = time.time()
+
+    for i in range(n_total):
+        if i % 100 == 0:
+            print(f"  [{i+1}/{n_total}] …")
+
+        feature_row = X_features_all.iloc[i].values
+        patient_id  = ids_all.iloc[i] if hasattr(ids_all, "iloc") else ids_all[i]
+        true_int    = int(y_full_all.iloc[i])
+        true_name   = int_to_classname.get(true_int, f"unknown({true_int})")
+
+        audio_info  = audio_lookup.get(patient_id, None)
+
+        result = pipeline.predict_single(
+            feature_row    = feature_row,
+            cough_wav_path = audio_info["cough_path"] if audio_info else None,
+            vowel_wav_path = audio_info["vowel_path"] if audio_info else None,
+        )
+
+        true_labels.append(true_name)
+        pred_labels.append(result["final_label"])
+        layer1_probs.append(result["layer1_prob"])
+
+    elapsed = time.time() - t0
+    print(f"\n[EVAL] Done in {elapsed:.1f}s  ({elapsed/n_total:.3f}s/patient)")
+
+    # ---- Build results DataFrame -------------------------------------------
+    results_df = pd.DataFrame({
+        "id"         : ids_all.values if hasattr(ids_all, "values") else ids_all,
+        "true_label" : true_labels,
+        "pred_label" : pred_labels,
+        "layer1_prob": layer1_probs,
+    })
+
+    # ---- Metrics -----------------------------------------------------------
+    acc      = accuracy_score(true_labels, pred_labels)
+    prec_mac = precision_score(true_labels, pred_labels, average="macro",
+                               labels=ALL_CLASSES, zero_division=0)
+    rec_mac  = recall_score(true_labels, pred_labels, average="macro",
+                            labels=ALL_CLASSES, zero_division=0)
+    f1_mac   = f1_score(true_labels, pred_labels, average="macro",
+                        labels=ALL_CLASSES, zero_division=0)
+    cm       = confusion_matrix(true_labels, pred_labels, labels=ALL_CLASSES)
+
+    print(f"\n  --- {split_name} Metrics (4-class, macro) ---")
+    print(f"  Accuracy          : {acc:.4f}")
+    print(f"  Precision (macro) : {prec_mac:.4f}")
+    print(f"  Recall (macro)    : {rec_mac:.4f}   *** PRIMARY ***")
+    print(f"  F1 (macro)        : {f1_mac:.4f}    *** PRIMARY ***")
+    print(f"\n  --- Classification Report ---")
+    print(classification_report(true_labels, pred_labels,
+                                labels=ALL_CLASSES, zero_division=0))
+    print(f"\n  --- Confusion Matrix (rows=True, cols=Predicted) ---")
+    print(pd.DataFrame(cm, index=ALL_CLASSES, columns=ALL_CLASSES).to_string())
+
+    wrong_at_l1 = results_df[(results_df["true_label"] == "healthy") &
+                              (results_df["pred_label"] != "healthy")]
+    wrong_at_l2 = results_df[(results_df["true_label"] != "healthy") &
+                              (results_df["pred_label"] == "healthy")]
+    print(f"\n  Layer 1 false positives (healthy→diseased): {len(wrong_at_l1)}")
+    print(f"  Layer 1 false negatives (diseased→healthy): {len(wrong_at_l2)}")
+
+    if save_plots:
+        _plot_cm(cm, ALL_CLASSES, split_name, save_dir)
+
+    metrics = {
+        "accuracy"        : acc,
+        "precision_macro" : prec_mac,
+        "recall_macro"    : rec_mac,
+        "f1_macro"        : f1_mac,
+        "confusion_matrix": cm,
+        "l1_fp_count"     : len(wrong_at_l1),
+        "l1_fn_count"     : len(wrong_at_l2),
+    }
+    return results_df, metrics
+
+
+def _plot_cm(cm, labels, split_name, save_dir):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=labels, yticklabels=labels,
+                ax=ax, linewidths=0.5, linecolor="gray")
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("True", fontsize=12)
+    ax.set_title(f"Stacked Pipeline — {split_name} Confusion Matrix", fontsize=13)
+    plt.tight_layout()
+    out = os.path.join(save_dir, f"StackedPipeline_{split_name}_CM.png".replace(" ", "_"))
+    plt.savefig(out, dpi=150)
+    print(f"[PLOT] Saved: {out}")
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# SECTION 7 — SAVE / RELOAD
+# ---------------------------------------------------------------------------
+
+def save_pipeline(pipeline: TwoLayerRespiratoryClassifier, save_dir: str, filename: str) -> str:
+    path = os.path.join(save_dir, filename)
+    with open(path, "wb") as f:
+        pickle.dump(pipeline, f)
+    print(f"\n[SAVE] Stacked pipeline saved → {path}")
+    return path
+
+
+def load_pipeline(pkl_path: str) -> TwoLayerRespiratoryClassifier:
+    """
+    Reload a previously saved TwoLayerRespiratoryClassifier.
+    The class definitions (RespiratoryClassifier, EfficientNetRespiratory, etc.)
+    must be importable, which they are if you run this script directly.
+    """
+    import __main__
+    __main__.RespiratoryClassifier    = RespiratoryClassifier
+    __main__.EfficientNetRespiratory  = EfficientNetRespiratory
+    __main__.TwoLayerRespiratoryClassifier = TwoLayerRespiratoryClassifier
+
+    with open(pkl_path, "rb") as f:
+        pipeline = pickle.load(f)
+    print(f"[LOAD] Stacked pipeline reloaded from {pkl_path}")
+    return pipeline
+
+
+# ---------------------------------------------------------------------------
+# SECTION 8 — MAIN
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # 8a. Build pipeline
+    print("\n[MAIN] Building stacked pipeline …")
+    pipeline = build_stacked_pipeline(
+        layer1_path      = CONFIG["layer1_path"],
+        layer2_pkl_path  = CONFIG["layer2_pkl_path"],
+        device           = DEVICE,
+        layer1_threshold = CONFIG["layer1_threshold"],
+    )
+
+    # 8b. Load data
+    print("\n[MAIN] Loading validation data …")
+    X_val, _, y_val_full, val_ids = load_features(
+        CONFIG["val_features_csv"], CONFIG["id_col"], CONFIG["label_col"]
+    )
+    val_audio_df = load_audio_paths(CONFIG["val_audio_csv"])
+
+    print("\n[MAIN] Loading test data …")
+    X_test, _, y_test_full, test_ids = load_features(
+        CONFIG["test_features_csv"], CONFIG["id_col"], CONFIG["label_col"]
+    )
+    test_audio_df = load_audio_paths(CONFIG["test_audio_csv"])
+
+    # 8c. Evaluate on validation set
+    val_results, val_metrics = evaluate_pipeline_on_split(
+        pipeline         = pipeline,
+        X_features_all   = X_val,
+        y_full_all       = y_val_full,
+        ids_all          = val_ids,
+        audio_df         = val_audio_df,
+        int_to_classname = INT_TO_CLASSNAME,
+        id_col           = CONFIG["id_col"],
+        split_name       = "Validation",
+        save_plots       = CONFIG["save_plots"],
+        save_dir         = CONFIG["save_dir"],
+    )
+
+    # 8d. Evaluate on test set
+    test_results, test_metrics = evaluate_pipeline_on_split(
+        pipeline         = pipeline,
+        X_features_all   = X_test,
+        y_full_all       = y_test_full,
+        ids_all          = test_ids,
+        audio_df         = test_audio_df,
+        int_to_classname = INT_TO_CLASSNAME,
+        id_col           = CONFIG["id_col"],
+        split_name       = "Test",
+        save_plots       = CONFIG["save_plots"],
+        save_dir         = CONFIG["save_dir"],
+    )
+
+    # 8e. Save pipeline
+    pipeline_path = save_pipeline(pipeline, CONFIG["save_dir"], CONFIG["pipeline_filename"])
+
+    # 8f. Verify reload
+    print("\n[VERIFY] Reloading pipeline …")
+    _ = load_pipeline(pipeline_path)
+    print("[VERIFY] Reload successful ✓")
+
+    # 8g. Save per-patient CSV results
+    val_csv  = os.path.join(CONFIG["save_dir"], "val_predictions.csv")
+    test_csv = os.path.join(CONFIG["save_dir"], "test_predictions.csv")
+    val_results.to_csv(val_csv,   index=False)
+    test_results.to_csv(test_csv, index=False)
+    print(f"[SAVE] Val  predictions → {val_csv}")
+    print(f"[SAVE] Test predictions → {test_csv}")
+
+    # 8h. Final summary
+    print("\n" + "="*60)
+    print("FINAL SUMMARY — Stacked Two-Layer Pipeline")
+    print("="*60)
+    print(f"  Val  Accuracy  : {val_metrics['accuracy']:.4f}")
+    print(f"  Val  Recall M  : {val_metrics['recall_macro']:.4f}   *** PRIMARY ***")
+    print(f"  Val  F1 Macro  : {val_metrics['f1_macro']:.4f}    *** PRIMARY ***")
+    print(f"  Val  L1 FP     : {val_metrics['l1_fp_count']} (healthy → diseased)")
+    print(f"  Val  L1 FN     : {val_metrics['l1_fn_count']} (diseased → healthy)")
+    print("  ---")
+    print(f"  Test Accuracy  : {test_metrics['accuracy']:.4f}")
+    print(f"  Test Recall M  : {test_metrics['recall_macro']:.4f}   *** PRIMARY ***")
+    print(f"  Test F1 Macro  : {test_metrics['f1_macro']:.4f}    *** PRIMARY ***")
+    print(f"  Test L1 FP     : {test_metrics['l1_fp_count']}")
+    print(f"  Test L1 FN     : {test_metrics['l1_fn_count']}")
+    print("  ---")
+    print(f"  Pipeline saved : {pipeline_path}")
+    print("="*60)
+    print("\n[DONE]")
+
+
+# =============================================================================
+# END OF FILE: stacked_pipeline.py
+# =============================================================================
